@@ -45,7 +45,6 @@ Dates Selection → Rooms & Guests → Summary → Submission → Confirmation S
 
 **Infrastructure**
 
-- Frontend deployed to **Vercel** — native Next.js ISR support, global CDN
 - Backend on a **VPS or managed server** (e.g. Forge-managed) — PHP-FPM + Nginx
 - Redis for cache, sessions, and queues
 - PostgreSQL as primary datastore
@@ -189,7 +188,7 @@ If the property JSON is updated (new room added, price change), an admin action 
 
 ```
 users
-  id, name, email, password, phone, timestamps, soft_deletes
+  id, firstname, surname, cellphone, email, password, phone, timestamps, soft_deletes
 
 rooms
   id, slug (unique), name, type, max_adults, max_children,
