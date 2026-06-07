@@ -1,0 +1,80 @@
+{
+    "name": "Sample Lodge",
+    "slug": "sample-lodge",
+    "description": "A peaceful retreat in the heart of nature.",
+    "amenities": ["wifi", "parking", "breakfast"],
+    "policies": {
+        "check_in_time": "14:00",
+        "check_out_time": "10:00",
+        "cancellation": "Free cancellation up to 48 hours before check-in."
+    },
+    "images": [],
+    "room_types": [
+        {
+            "slug": "standard",
+            "name": "Standard Room",
+            "description": "Comfortable accommodation for couples or solo travellers.",
+            "icon_slug": "bed",
+            "is_active": true,
+            "sort_order": 1
+        },
+        {
+            "slug": "family",
+            "name": "Family Room",
+            "description": "Spacious room with space for the whole family.",
+            "icon_slug": "users",
+            "is_active": true,
+            "sort_order": 2
+        },
+        {
+            "slug": "suite",
+            "name": "Suite",
+            "description": "Premium suite with separate living area and panoramic views.",
+            "icon_slug": "star",
+            "is_active": true,
+            "sort_order": 3
+        }
+    ],
+    "rooms": [
+        {
+            "slug": "garden-view",
+            "name": "Garden View Room",
+            "room_type_slug": "standard",
+            "max_adults": 2,
+            "max_children": 0,
+            "price_per_night_cents": 85000,
+            "is_active": true,
+            "total_units": 4
+        },
+        {
+            "slug": "mountain-view",
+            "name": "Mountain View Room",
+            "room_type_slug": "standard",
+            "max_adults": 2,
+            "max_children": 1,
+            "price_per_night_cents": 95000,
+            "is_active": true,
+            "total_units": 3
+        },
+        {
+            "slug": "family-cottage",
+            "name": "Family Cottage",
+            "room_type_slug": "family",
+            "max_adults": 2,
+            "max_children": 3,
+            "price_per_night_cents": 145000,
+            "is_active": true,
+            "total_units": 2
+        },
+        {
+            "slug": "executive-suite",
+            "name": "Executive Suite",
+            "room_type_slug": "suite",
+            "max_adults": 2,
+            "max_children": 2,
+            "price_per_night_cents": 220000,
+            "is_active": true,
+            "total_units": 1
+        }
+    ]
+}
