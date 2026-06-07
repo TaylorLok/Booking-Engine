@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\BookingStatus;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
@@ -13,7 +14,14 @@ return new class extends Migration
     {
         Schema::create('booking_status_events', function (Blueprint $table) {
             $table->id();
-            $table->timestamps();
+            $table->foreignId('booking_id')->constrained('bookings')->cascadeOnDelete();
+            $table->enum('from_status', BookingStatus::values())->nullable();
+            $table->enum('to_status', BookingStatus::values());
+            $table->string('triggered_by', 50)->default('system');
+            $table->json('metadata')->nullable();
+            $table->timestamp('created_at')->useCurrent();
+
+            $table->index(['booking_id', 'created_at']);
         });
     }
 
