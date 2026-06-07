@@ -6,10 +6,15 @@ use App\Enums\BookingStatus;
 use App\Models\BookingRoom;
 use App\Models\Room;
 use App\Models\RoomHold;
+use App\Support\BookingFlowLogger;
 use Illuminate\Support\Carbon;
 
 class AvailabilityService
 {
+    public function __construct(
+        private readonly BookingFlowLogger $logger,
+    ) {}
+
     public function getAvailableUnits(Room $room, Carbon|string $checkIn, Carbon|string $checkOut): int
     {
         $confirmedCount = BookingRoom::query()
@@ -26,7 +31,18 @@ class AvailabilityService
             ->whereDateRangeOverlaps($checkIn, $checkOut)
             ->count();
 
-        return max(0, $room->total_units - $confirmedCount - $activeHolds);
+        $available = max(0, $room->total_units - $confirmedCount - $activeHolds);
+
+        $this->logger->debug('availability.units_calculated', [
+            ...$this->logger->room($room),
+            'check_in' => Carbon::parse($checkIn)->toDateString(),
+            'check_out' => Carbon::parse($checkOut)->toDateString(),
+            'confirmed_count' => $confirmedCount,
+            'active_holds' => $activeHolds,
+            'available_units' => $available,
+        ]);
+
+        return $available;
     }
 
     /**
@@ -35,6 +51,13 @@ class AvailabilityService
      */
     public function checkRooms(array $roomSelections, Carbon|string $checkIn, Carbon|string $checkOut): array
     {
+        $this->logger->info('availability.check_started', [
+            'check_in' => Carbon::parse($checkIn)->toDateString(),
+            'check_out' => Carbon::parse($checkOut)->toDateString(),
+            'room_count' => count($roomSelections),
+            'room_ids' => collect($roomSelections)->pluck('room_id')->all(),
+        ]);
+
         $unavailableRoomIds = [];
 
         foreach ($roomSelections as $selection) {
@@ -43,14 +66,44 @@ class AvailabilityService
                 ->where('is_active', true)
                 ->first();
 
-            if ($room === null || $this->getAvailableUnits($room, $checkIn, $checkOut) < 1) {
+            if ($room === null) {
                 $unavailableRoomIds[] = (int) $selection['room_id'];
+
+                $this->logger->warning('availability.room_not_found_or_inactive', [
+                    'room_id' => $selection['room_id'],
+                    'check_in' => Carbon::parse($checkIn)->toDateString(),
+                    'check_out' => Carbon::parse($checkOut)->toDateString(),
+                ]);
+
+                continue;
+            }
+
+            $availableUnits = $this->getAvailableUnits($room, $checkIn, $checkOut);
+
+            if ($availableUnits < 1) {
+                $unavailableRoomIds[] = (int) $selection['room_id'];
+
+                $this->logger->warning('availability.room_unavailable', [
+                    ...$this->logger->room($room),
+                    'check_in' => Carbon::parse($checkIn)->toDateString(),
+                    'check_out' => Carbon::parse($checkOut)->toDateString(),
+                    'available_units' => $availableUnits,
+                ]);
             }
         }
 
-        return [
+        $result = [
             'available' => $unavailableRoomIds === [],
             'unavailable_room_ids' => $unavailableRoomIds,
         ];
+
+        $this->logger->info('availability.check_completed', [
+            'check_in' => Carbon::parse($checkIn)->toDateString(),
+            'check_out' => Carbon::parse($checkOut)->toDateString(),
+            'available' => $result['available'],
+            'unavailable_room_ids' => $unavailableRoomIds,
+        ]);
+
+        return $result;
     }
 }

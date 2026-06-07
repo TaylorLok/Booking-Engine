@@ -37,6 +37,7 @@
     ],
     "rooms": [
         {
+            "id": 1,
             "slug": "garden-view",
             "name": "Garden View Room",
             "room_type_slug": "standard",
@@ -47,6 +48,7 @@
             "total_units": 4
         },
         {
+            "id": 2,
             "slug": "mountain-view",
             "name": "Mountain View Room",
             "room_type_slug": "standard",
@@ -57,6 +59,7 @@
             "total_units": 3
         },
         {
+            "id": 3,
             "slug": "family-cottage",
             "name": "Family Cottage",
             "room_type_slug": "family",
@@ -67,6 +70,7 @@
             "total_units": 2
         },
         {
+            "id": 4,
             "slug": "executive-suite",
             "name": "Executive Suite",
             "room_type_slug": "suite",

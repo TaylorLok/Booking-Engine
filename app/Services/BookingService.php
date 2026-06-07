@@ -10,6 +10,7 @@ use App\Models\BookingStatusEvent;
 use App\Models\Room;
 use App\Models\RoomHold;
 use App\Models\User;
+use App\Support\BookingFlowLogger;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -22,6 +23,7 @@ class BookingService
 {
     public function __construct(
         private readonly AvailabilityService $availabilityService,
+        private readonly BookingFlowLogger $logger,
     ) {}
 
     /**
@@ -39,6 +41,16 @@ class BookingService
      */
     public function create(User $user, array $data): Booking
     {
+        $this->logger->info('booking.create.started', [
+            'user_id' => $user->id,
+            'idempotency_key' => $data['idempotency_key'],
+            'check_in' => $data['check_in'],
+            'check_out' => $data['check_out'],
+            'adults' => $data['adults'],
+            'children' => $data['children'] ?? 0,
+            'room_ids' => collect($data['rooms'])->pluck('room_id')->all(),
+        ]);
+
         // --- Idempotency check ---
         // If this key was seen before, return the existing booking — no duplicate created.
         $existing = Booking::query()
@@ -46,6 +58,11 @@ class BookingService
             ->first();
 
         if ($existing !== null) {
+            $this->logger->info('booking.create.idempotency_hit', [
+                ...$this->logger->booking($existing),
+                'user_id' => $user->id,
+            ]);
+
             return $existing;
         }
 
@@ -63,6 +80,14 @@ class BookingService
         );
 
         if (! $availability['available']) {
+            $this->logger->warning('booking.create.availability_rejected', [
+                'user_id' => $user->id,
+                'idempotency_key' => $data['idempotency_key'],
+                'check_in' => $checkIn->toDateString(),
+                'check_out' => $checkOut->toDateString(),
+                'unavailable_room_ids' => $availability['unavailable_room_ids'],
+            ]);
+
             throw ValidationException::withMessages([
                 'rooms' => ['One or more selected rooms are no longer available for the chosen dates.'],
             ]);
@@ -70,6 +95,15 @@ class BookingService
 
         // --- Pricing — always calculated server-side, never trusted from client ---
         $pricing = $this->calculatePricing($data['rooms'], $nights);
+
+        $this->logger->info('booking.create.pricing_calculated', [
+            'user_id' => $user->id,
+            'nights' => $nights,
+            'subtotal_cents' => $pricing['subtotal_cents'],
+            'taxes_cents' => $pricing['taxes_cents'],
+            'total_cents' => $pricing['total_cents'],
+            'lines' => $pricing['lines'],
+        ]);
 
         $booking = DB::transaction(function () use ($user, $data, $checkIn, $checkOut, $nights, $pricing): Booking {
             $booking = Booking::query()->create([
@@ -109,7 +143,17 @@ class BookingService
             return $booking;
         });
 
+        $this->logger->info('booking.create.completed', [
+            ...$this->logger->booking($booking),
+            'room_ids' => $booking->bookingRooms->pluck('room_id')->all(),
+        ]);
+
         ProcessBookingJob::dispatch($booking->id)->onQueue('bookings');
+
+        $this->logger->info('booking.job.dispatched', [
+            ...$this->logger->booking($booking),
+            'queue' => 'bookings',
+        ]);
 
         return $booking->load('bookingRooms.room');
     }
@@ -191,13 +235,22 @@ class BookingService
      */
     public function process(Booking $booking): void
     {
+        $this->logger->info('booking.process.started', $this->logger->booking($booking));
+
         if ($booking->status !== BookingStatus::Pending) {
+            $this->logger->info('booking.process.skipped_non_pending', $this->logger->booking($booking));
+
             return;
         }
 
         // --- Circuit breaker check ---
         // If the external API has been failing repeatedly, stop hammering it.
         if ($this->isCircuitOpen()) {
+            $this->logger->warning('booking.process.circuit_breaker_open', [
+                ...$this->logger->booking($booking),
+                'failure_count' => cache()->get('booking:circuit_breaker:failures', 0),
+            ]);
+
             throw new RuntimeException('Circuit breaker open — external API unavailable. Job will retry.');
         }
 
@@ -212,12 +265,24 @@ class BookingService
                     $this->placeHold($booking, $line->room);
                 }
             });
+
+            $this->logger->info('booking.process.holds_placed', [
+                ...$this->logger->booking($booking),
+                'room_ids' => $booking->bookingRooms->pluck('room_id')->all(),
+            ]);
         } catch (Throwable $exception) {
+            $this->logger->error('booking.process.hold_failed', $this->logger->booking($booking), $exception);
+
             $this->failBooking($booking, 'Room no longer available.', 'process_booking_job');
             throw $exception;
         }
 
         $booking->increment('api_attempt_count');
+
+        $this->logger->info('booking.process.external_api_attempt', [
+            ...$this->logger->booking($booking->fresh()),
+            'attempt_number' => $booking->api_attempt_count,
+        ]);
 
         // --- Call external API ---
         try {
@@ -244,9 +309,20 @@ class BookingService
                     triggeredBy: 'process_booking_job',
                 );
             });
+
+            $this->logger->info('booking.process.confirmed', [
+                ...$this->logger->booking($booking->fresh()),
+                'external_reference' => $externalReference,
+            ]);
         } catch (Throwable $exception) {
             // Record the failure against the circuit breaker counter
             $this->recordExternalApiFailure();
+
+            $this->logger->error('booking.process.external_api_failed', [
+                ...$this->logger->booking($booking->fresh()),
+                'attempt_number' => $booking->api_attempt_count,
+            ], $exception);
+
             throw $exception;
         }
     }
@@ -258,10 +334,23 @@ class BookingService
     public function failBooking(Booking $booking, string $reason, string $triggeredBy = 'system'): void
     {
         if ($booking->status === BookingStatus::Failed) {
+            $this->logger->debug('booking.fail.skipped_already_failed', [
+                ...$this->logger->booking($booking),
+                'reason' => $reason,
+                'triggered_by' => $triggeredBy,
+            ]);
+
             return;
         }
 
         $fromStatus = $booking->status;
+
+        $this->logger->warning('booking.fail.started', [
+            ...$this->logger->booking($booking),
+            'from_status' => $fromStatus->value,
+            'reason' => $reason,
+            'triggered_by' => $triggeredBy,
+        ]);
 
         $booking->update([
             'status'         => BookingStatus::Failed,
@@ -277,6 +366,12 @@ class BookingService
             triggeredBy: $triggeredBy,
             metadata: ['reason' => $reason],
         );
+
+        $this->logger->warning('booking.fail.completed', [
+            ...$this->logger->booking($booking->fresh()),
+            'reason' => $reason,
+            'triggered_by' => $triggeredBy,
+        ]);
     }
 
     /**
@@ -296,6 +391,14 @@ class BookingService
             'to_status'   => $to,
             'triggered_by' => $triggeredBy,
             'metadata'    => $metadata,
+        ]);
+
+        $this->logger->info('booking.status.changed', [
+            ...$this->logger->booking($booking),
+            'from_status' => $from?->value,
+            'to_status' => $to->value,
+            'triggered_by' => $triggeredBy,
+            'metadata' => $metadata,
         ]);
     }
 
@@ -321,10 +424,24 @@ class BookingService
 
         if (! cache()->has($key)) {
             cache()->put($key, 1, $window);
+
+            $this->logger->warning('circuit_breaker.failure_recorded', [
+                'failure_count' => 1,
+                'threshold' => config('booking.circuit_breaker.failure_threshold', 5),
+                'window_seconds' => $window,
+            ]);
+
             return;
         }
 
-        cache()->increment($key);
+        $count = cache()->increment($key);
+
+        $this->logger->warning('circuit_breaker.failure_recorded', [
+            'failure_count' => $count,
+            'threshold' => config('booking.circuit_breaker.failure_threshold', 5),
+            'window_seconds' => $window,
+            'circuit_open' => $count >= config('booking.circuit_breaker.failure_threshold', 5),
+        ]);
     }
 
     // -------------------------------------------------------------------------
@@ -337,6 +454,11 @@ class BookingService
      */
     private function placeHold(Booking $booking, Room $room): void
     {
+        $this->logger->info('hold.place.started', [
+            ...$this->logger->booking($booking),
+            ...$this->logger->room($room),
+        ]);
+
         // Lock existing holds for this room + date range so no concurrent
         // transaction can read a stale count.
         $existingHolds = RoomHold::query()
@@ -354,11 +476,30 @@ class BookingService
 
         $available = $room->total_units - $confirmedCount - $existingHolds->count();
 
+        $this->logger->debug('hold.place.availability_snapshot', [
+            ...$this->logger->booking($booking),
+            ...$this->logger->room($room),
+            'confirmed_count' => $confirmedCount,
+            'active_holds' => $existingHolds->count(),
+            'available_units' => $available,
+            'existing_hold_ids' => $existingHolds->pluck('id')->all(),
+        ]);
+
         if ($available < 1) {
+            $this->logger->warning('hold.place.rejected_no_units', [
+                ...$this->logger->booking($booking),
+                ...$this->logger->room($room),
+                'confirmed_count' => $confirmedCount,
+                'active_holds' => $existingHolds->count(),
+                'available_units' => $available,
+            ]);
+
             throw new RuntimeException('Room no longer available.');
         }
 
-        RoomHold::query()->updateOrCreate(
+        $expiresAt = now()->addMinutes(config('booking.hold_duration_minutes', 15));
+
+        $hold = RoomHold::query()->updateOrCreate(
             [
                 'room_id'    => $room->id,
                 'booking_id' => $booking->id,
@@ -366,11 +507,16 @@ class BookingService
             [
                 'check_in'   => $booking->check_in,
                 'check_out'  => $booking->check_out,
-                'expires_at' => now()->addMinutes(
-                    config('booking.hold_duration_minutes', 15)
-                ),
+                'expires_at' => $expiresAt,
             ],
         );
+
+        $this->logger->info('hold.place.completed', [
+            ...$this->logger->booking($booking),
+            ...$this->logger->room($room),
+            ...$this->logger->hold($hold),
+            'hold_duration_minutes' => config('booking.hold_duration_minutes', 15),
+        ]);
     }
 
     /**
@@ -379,9 +525,31 @@ class BookingService
      */
     private function releaseHolds(Booking $booking): void
     {
+        $holds = RoomHold::query()
+            ->where('booking_id', $booking->id)
+            ->get();
+
+        if ($holds->isEmpty()) {
+            $this->logger->debug('hold.release.none_found', $this->logger->booking($booking));
+
+            return;
+        }
+
+        foreach ($holds as $hold) {
+            $this->logger->info('hold.release.completed', [
+                ...$this->logger->booking($booking),
+                ...$this->logger->hold($hold),
+            ]);
+        }
+
         RoomHold::query()
             ->where('booking_id', $booking->id)
             ->delete();
+
+        $this->logger->info('hold.release.batch_completed', [
+            ...$this->logger->booking($booking),
+            'released_count' => $holds->count(),
+        ]);
     }
 
     /**
@@ -397,42 +565,67 @@ class BookingService
 
         // No external API configured — local/dev shortcut
         if (empty($url)) {
+            $this->logger->info('booking.external_api.skipped_local_mode', $this->logger->booking($booking));
+
             return 'LOCAL-' . $booking->reference;
         }
 
+        $requestPayload = [
+            'reference'  => $booking->reference,
+            'check_in'   => $booking->check_in->toDateString(),
+            'check_out'  => $booking->check_out->toDateString(),
+            'total_cents' => $booking->total_cents,
+            'rooms'      => $booking->bookingRooms
+                ->map(fn (BookingRoom $line): array => [
+                    'room_id'  => $line->room_id,
+                    'adults'   => $line->adults,
+                    'children' => $line->children,
+                ])
+                ->values()
+                ->all(),
+        ];
+
+        $this->logger->info('booking.external_api.request_sent', [
+            ...$this->logger->booking($booking),
+            'url' => $url,
+            'timeout' => config('booking.external_api.timeout', 10),
+            'payload' => $requestPayload,
+        ]);
+
         $response = Http::timeout(config('booking.external_api.timeout', 10))
             ->withToken(config('booking.external_api.key', ''))
-            ->post($url, [
-                'reference'  => $booking->reference,
-                'check_in'   => $booking->check_in->toDateString(),
-                'check_out'  => $booking->check_out->toDateString(),
-                'total_cents' => $booking->total_cents,
-                'rooms'      => $booking->bookingRooms
-                    ->map(fn (BookingRoom $line): array => [
-                        'room_id'  => $line->room_id,
-                        'adults'   => $line->adults,
-                        'children' => $line->children,
-                    ])
-                    ->values()
-                    ->all(),
-            ]);
+            ->post($url, $requestPayload);
 
         // Always snapshot the raw response for audit — even on failure
-        $payload = $response->json();
+        $responseBody = $response->json();
 
         $booking->update([
-            'external_response_snapshot' => is_array($payload)
-                ? $payload
+            'external_response_snapshot' => is_array($responseBody)
+                ? $responseBody
                 : ['body' => $response->body(), 'status' => $response->status()],
         ]);
 
         if (! $response->successful()) {
+            $this->logger->error('booking.external_api.response_failed', [
+                ...$this->logger->booking($booking),
+                'http_status' => $response->status(),
+                'response_body' => is_array($responseBody) ? $responseBody : $response->body(),
+            ]);
+
             throw new RuntimeException(
                 'External booking API returned ' . $response->status()
             );
         }
 
-        return is_array($payload) ? ($payload['reference'] ?? null) : null;
+        $externalReference = is_array($responseBody) ? ($responseBody['reference'] ?? null) : null;
+
+        $this->logger->info('booking.external_api.response_success', [
+            ...$this->logger->booking($booking),
+            'http_status' => $response->status(),
+            'external_reference' => $externalReference,
+        ]);
+
+        return $externalReference;
     }
 
     /**
