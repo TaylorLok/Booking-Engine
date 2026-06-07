@@ -13,7 +13,16 @@ return new class extends Migration
     {
         Schema::create('booking_rooms', function (Blueprint $table) {
             $table->id();
+            $table->foreignId('booking_id')->constrained('bookings')->cascadeOnDelete();
+            $table->foreignId('room_id')->constrained('rooms')->restrictOnDelete();
+            $table->unsignedTinyInteger('adults')->default(1);
+            $table->unsignedTinyInteger('children')->default(0);
+            $table->unsignedInteger('price_per_night_cents');
+            $table->unsignedSmallInteger('nights_count');
+            $table->unsignedInteger('line_total_cents')->storedAs('price_per_night_cents * nights_count');
             $table->timestamps();
+
+            $table->unique(['booking_id', 'room_id']);
         });
     }
 
